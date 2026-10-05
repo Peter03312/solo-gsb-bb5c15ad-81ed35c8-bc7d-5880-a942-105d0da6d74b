@@ -1,0 +1,35 @@
+services:
+  # 一次性初始化服务：建数据卷目录并幂等建表
+  init:
+    build: .
+    command: ["python", "-m", "app.init_db"]
+    environment:
+      DB_PATH: /data/drill.db
+    volumes:
+      - drill-data:/data
+    restart: "no"
+
+  api:
+    build: .
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    environment:
+      DB_PATH: /data/drill.db
+      APP_HOST: 0.0.0.0
+      APP_PORT: "8080"
+      BUSY_TIMEOUT_MS: "30000"
+    ports:
+      - "8080:8080"
+    volumes:
+      - drill-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  drill-data:
