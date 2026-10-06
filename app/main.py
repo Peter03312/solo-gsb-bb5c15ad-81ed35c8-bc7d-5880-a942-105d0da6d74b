@@ -9,7 +9,15 @@ from fastapi.responses import JSONResponse
 from . import service
 from .db import connect, init_db
 from .errors import APIError
-from .models import Correction, DrillCreate, MarkLost, ReportBatch, SealCreate, TerminalsRegister
+from .models import (
+    CompleteDrill,
+    Correction,
+    DrillCreate,
+    MarkLost,
+    ReportBatch,
+    SealCreate,
+    TerminalsRegister,
+)
 
 
 @asynccontextmanager
@@ -143,3 +151,14 @@ def list_seals(drill_id: str, conn=Depends(db)) -> dict:
 @app.get("/api/drills/{drill_id}/seals/{version}")
 def get_seal(drill_id: str, version: int, conn=Depends(db)) -> dict:
     return service.get_seal(conn, drill_id, version)
+
+
+# ---------------------------------------------------------------- 完成演练
+
+@app.post("/api/drills/{drill_id}/complete")
+def complete_drill(drill_id: str, payload: CompleteDrill, conn=Depends(db)) -> dict:
+    """负责人主动完成演练：缺号全部闭合时原子生成最终封存版本并转为已完成。
+
+    幂等：重复完成返回同一最终封存版本；条件不满足返回 409 且不产生封存。
+    """
+    return service.complete_drill(conn, drill_id, payload.note, payload.completed_by)

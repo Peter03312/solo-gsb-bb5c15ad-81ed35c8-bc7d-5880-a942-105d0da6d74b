@@ -55,3 +55,8 @@ class MarkLost(BaseModel):
 
 class SealCreate(BaseModel):
     note: Optional[str] = None
+
+
+class CompleteDrill(BaseModel):
+    note: Optional[str] = None
+    completed_by: Optional[str] = None

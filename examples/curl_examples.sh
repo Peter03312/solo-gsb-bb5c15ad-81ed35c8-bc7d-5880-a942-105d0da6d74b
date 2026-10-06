@@ -74,4 +74,30 @@ curl -s -X POST "$BASE/api/drills/$DID/terminals/GHOST/reports" -H "$ctype" \
 curl -s -X POST "$BASE/api/drills/$DID/terminals/T1/reports" -H "$ctype" \
   -d '{"entries":[{"seq":-1,"occurred_at":"2026-10-05T09:00:00Z","event_type":"x","content":"y"}]}'; echo
 
+echo "## 12. 负责人主动完成演练：原子生成最终封存版本并转为已完成（缺号未闭合时会 409 且不产生封存）"
+curl -s -X POST "$BASE/api/drills/$DID/complete" -H "$ctype" \
+  -d '{"note":"演练收官","completed_by":"演练负责人"}'; echo
+
+echo "## 13. 完成后的写操作一律 409 drill_completed：终端登记 / 非重复上报 / 更正 / 缺号确认 / 再次封存"
+curl -s -X POST "$BASE/api/drills/$DID/terminals" -H "$ctype" \
+  -d '{"terminals":[{"code":"T9"}]}'; echo
+curl -s -X POST "$BASE/api/drills/$DID/terminals/T1/reports" -H "$ctype" \
+  -d '{"entries":[{"seq":4,"occurred_at":"2026-10-05T09:50:00Z","event_type":"x","content":"完成后新序号"}]}'; echo
+curl -s -X PUT "$BASE/api/drills/$DID/records/T1/1" -H "$ctype" \
+  -d '{"content":"试图更正","reason":"完成后更正"}'; echo
+curl -s -X POST "$BASE/api/drills/$DID/terminals/T2/gaps/lost" -H "$ctype" -d '{"seq":1}'; echo
+curl -s -X POST "$BASE/api/drills/$DID/seals" -H "$ctype" -d '{"note":"再次封存"}'; echo
+
+echo "## 14. 完成后：相同内容重试仍 duplicate；冲突内容被拒绝且不新增冲突证据"
+curl -s -X POST "$BASE/api/drills/$DID/terminals/T1/reports" -H "$ctype" \
+  -d '{"entries":[{"seq":1,"occurred_at":"2026-10-05T09:00:00Z","event_type":"login","content":"终端上线自检通过"}]}'; echo
+curl -s -X POST "$BASE/api/drills/$DID/terminals/T1/reports" -H "$ctype" \
+  -d '{"entries":[{"seq":1,"occurred_at":"2026-10-05T09:00:00Z","event_type":"login","content":"完成后的冲突内容"}]}'; echo
+curl -s "$BASE/api/drills/$DID/conflicts"; echo
+
+echo "## 15. 重复完成返回同一最终版本；历史读取仍可用"
+curl -s -X POST "$BASE/api/drills/$DID/complete" -H "$ctype" -d '{"note":"重复完成"}'; echo
+curl -s "$BASE/api/drills/$DID/seals"; echo
+curl -s "$BASE/api/drills/$DID/timeline"; echo
+
 echo "DONE drill_id=$DID"

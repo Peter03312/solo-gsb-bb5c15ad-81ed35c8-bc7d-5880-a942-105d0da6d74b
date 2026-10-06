@@ -153,6 +153,45 @@ def main() -> None:
         {"entries": [{"seq": -3, "occurred_at": "2026-10-05T09:00:00Z",
                       "event_type": "x", "content": "y"}]}))
 
+    # 12. 负责人主动完成演练：原子生成最终封存版本并转为已完成
+    step("12. 完成演练（缺号未闭合时会 409 且不产生封存版本）")
+    show("完成", call("POST", f"/api/drills/{drill_id}/complete",
+                      {"note": "演练收官", "completed_by": "演练负责人"}))
+
+    # 13. 完成后的写操作一律 409 drill_completed
+    step("13. 完成后：终端登记 / 非重复上报 / 更正 / 缺号确认 / 再次封存均被拒绝")
+    show("登记终端", call("POST", f"/api/drills/{drill_id}/terminals",
+                          {"terminals": [{"code": "T9"}]}))
+    show("新序号上报", call(
+        "POST", f"/api/drills/{drill_id}/terminals/T1/reports",
+        {"entries": [{"seq": 4, "occurred_at": "2026-10-05T09:50:00Z",
+                      "event_type": "x", "content": "完成后新序号"}]}))
+    show("更正", call("PUT", f"/api/drills/{drill_id}/records/T1/1",
+                      {"content": "试图更正", "reason": "完成后更正"}))
+    show("缺号确认", call("POST", f"/api/drills/{drill_id}/terminals/T2/gaps/lost",
+                          {"seq": 1}))
+    show("再次封存", call("POST", f"/api/drills/{drill_id}/seals",
+                          {"note": "再次封存"}))
+
+    # 14. 完成后：相同内容重试仍 duplicate；冲突内容被拒绝且不新增冲突证据
+    step("14. 完成后：相同内容重试仍 duplicate；冲突内容被拒绝且不留冲突证据")
+    show("相同内容重试", call(
+        "POST", f"/api/drills/{drill_id}/terminals/T1/reports",
+        {"entries": [{"seq": 1, "occurred_at": "2026-10-05T09:00:00Z",
+                      "event_type": "login", "content": "终端上线自检通过"}]}))
+    show("冲突内容", call(
+        "POST", f"/api/drills/{drill_id}/terminals/T1/reports",
+        {"entries": [{"seq": 1, "occurred_at": "2026-10-05T09:00:00Z",
+                      "event_type": "login", "content": "完成后的冲突内容"}]}))
+    show("冲突证据未新增", call("GET", f"/api/drills/{drill_id}/conflicts"))
+
+    # 15. 重复完成返回同一最终版本；历史读取仍可用
+    step("15. 重复完成返回同一最终版本；历史读取仍可用")
+    show("重复完成", call("POST", f"/api/drills/{drill_id}/complete",
+                          {"note": "重复完成"}))
+    show("封存版本列表", call("GET", f"/api/drills/{drill_id}/seals"))
+    show("时间线", call("GET", f"/api/drills/{drill_id}/timeline"))
+
 
 if __name__ == "__main__":
     main()
