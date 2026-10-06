@@ -153,6 +153,55 @@ def main() -> None:
         {"entries": [{"seq": -3, "occurred_at": "2026-10-05T09:00:00Z",
                       "event_type": "x", "content": "y"}]}))
 
+    # 12. 主动完成：T3 只报了 1、3（缺 2），缺号未闭合时完成被拒
+    step("12. 主动完成：缺号未闭合 => 409 且不生成封存版本")
+    show("T3 上报 3（缺 2）", call(
+        "POST", f"/api/drills/{drill_id}/terminals/T3/reports",
+        {"entries": [
+            {"seq": 3, "occurred_at": "2026-10-05T09:50:00Z",
+             "event_type": "command", "content": "指挥车就位回执"},
+        ]}))
+    show("完成被拒", call("POST", f"/api/drills/{drill_id}/complete",
+                          {"completed_by": "演练负责人"}))
+
+    # 13. 逐号确认 T3 缺号 2 丢失后，完成原子生成最终封存版本并转为已完成
+    step("13. 闭合缺号后完成 => 原子生成最终封存版本（201）")
+    show("确认 T3#2 丢失", call("POST", f"/api/drills/{drill_id}/terminals/T3/gaps/lost",
+                                {"seq": 2, "reason": "终端掉电未缓存",
+                                 "confirmed_by": "保障组"}))
+    show("完成演练", call("POST", f"/api/drills/{drill_id}/complete",
+                          {"note": "演练正式收官", "completed_by": "张指挥"}))
+    show("演练状态（completed）", call("GET", f"/api/drills/{drill_id}"))
+
+    # 14. 完成后：变更类操作一律拒绝；相同内容重试仍 duplicate；冲突不新增证据
+    step("14. 完成后的拒绝语义")
+    show("登记终端被拒", call("POST", f"/api/drills/{drill_id}/terminals",
+                              {"terminals": [{"code": "T9"}]}))
+    show("混合批次：重试=duplicate，新序号/冲突=rejected", call(
+        "POST", f"/api/drills/{drill_id}/terminals/T1/reports",
+        {"entries": [
+            {"seq": 1, "occurred_at": "2026-10-05T09:00:00Z",
+             "event_type": "login", "content": "终端上线自检通过"},      # 相同内容重试
+            {"seq": 4, "occurred_at": "2026-10-05T10:00:00Z",
+             "event_type": "x", "content": "迟到的新序号"},              # 非重复上报
+            {"seq": 2, "occurred_at": "2026-10-05T09:10:00Z",
+             "event_type": "water_level", "content": "被篡改"},          # 冲突内容
+        ]}))
+    show("冲突证据未新增", call("GET", f"/api/drills/{drill_id}/conflicts"))
+    show("更正被拒", call("PUT", f"/api/drills/{drill_id}/records/T1/1",
+                          {"content": "试图更正", "reason": "完成后更正"}))
+    show("缺号确认被拒", call("POST", f"/api/drills/{drill_id}/terminals/T1/gaps/lost",
+                              {"seq": 1}))
+    show("再次封存被拒", call("POST", f"/api/drills/{drill_id}/seals", {"note": "x"}))
+
+    # 15. 重复完成幂等返回同一最终版本；历史读取仍可用
+    step("15. 重复完成 => 同一最终版本（200）；历史读取仍可用")
+    show("重复完成", call("POST", f"/api/drills/{drill_id}/complete",
+                          {"note": "再次完成", "completed_by": "别人"}))
+    show("封存版本列表（is_final 标记）", call("GET", f"/api/drills/{drill_id}/seals"))
+    show("最终封存版本", call("GET", f"/api/drills/{drill_id}/seals/2"))
+    show("历史时间线仍可读", call("GET", f"/api/drills/{drill_id}/timeline"))
+
 
 if __name__ == "__main__":
     main()

@@ -3,13 +3,21 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
 from . import service
 from .db import connect, init_db
 from .errors import APIError
-from .models import Correction, DrillCreate, MarkLost, ReportBatch, SealCreate, TerminalsRegister
+from .models import (
+    Correction,
+    DrillComplete,
+    DrillCreate,
+    MarkLost,
+    ReportBatch,
+    SealCreate,
+    TerminalsRegister,
+)
 
 
 @asynccontextmanager
@@ -143,3 +151,19 @@ def list_seals(drill_id: str, conn=Depends(db)) -> dict:
 @app.get("/api/drills/{drill_id}/seals/{version}")
 def get_seal(drill_id: str, version: int, conn=Depends(db)) -> dict:
     return service.get_seal(conn, drill_id, version)
+
+
+# ---------------------------------------------------------------- 完成演练
+
+@app.post("/api/drills/{drill_id}/complete")
+def complete_drill(drill_id: str, response: Response,
+                   payload: DrillComplete | None = None, conn=Depends(db)) -> dict:
+    """主动完成演练：缺号全部闭合时原子生成最终封存版本并转为已完成。
+
+    首次完成返回 201；重复完成幂等返回 200 与同一最终版本。
+    """
+    payload = payload or DrillComplete()
+    result = service.complete_drill(conn, drill_id, payload.note, payload.completed_by)
+    if not result["already_completed"]:
+        response.status_code = 201
+    return result

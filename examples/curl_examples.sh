@@ -74,4 +74,39 @@ curl -s -X POST "$BASE/api/drills/$DID/terminals/GHOST/reports" -H "$ctype" \
 curl -s -X POST "$BASE/api/drills/$DID/terminals/T1/reports" -H "$ctype" \
   -d '{"entries":[{"seq":-1,"occurred_at":"2026-10-05T09:00:00Z","event_type":"x","content":"y"}]}'; echo
 
+echo "## 12. 主动完成：T3 缺号 2 未闭合 => 409 unresolved_gaps，不生成封存版本"
+curl -s -X POST "$BASE/api/drills/$DID/terminals/T3/reports" -H "$ctype" -d '{
+  "entries": [{"seq": 3, "occurred_at": "2026-10-05T09:50:00Z", "event_type": "command", "content": "指挥车就位回执"}]
+}'; echo
+curl -s -X POST "$BASE/api/drills/$DID/complete" -H "$ctype" -d '{"completed_by":"演练负责人"}'; echo
+
+echo "## 13. 逐号确认 T3#2 丢失后完成 => 原子生成最终封存版本并转为已完成（201）"
+curl -s -X POST "$BASE/api/drills/$DID/terminals/T3/gaps/lost" -H "$ctype" \
+  -d '{"seq":2,"reason":"终端掉电未缓存","confirmed_by":"保障组"}'; echo
+curl -s -X POST "$BASE/api/drills/$DID/complete" -H "$ctype" \
+  -d '{"note":"演练正式收官","completed_by":"张指挥"}'; echo
+curl -s "$BASE/api/drills/$DID"; echo
+
+echo "## 14. 完成后：登记/非重复上报/更正/缺号确认/再封存一律拒绝；重试仍 duplicate；冲突不新增证据"
+curl -s -X POST "$BASE/api/drills/$DID/terminals" -H "$ctype" -d '{"terminals":[{"code":"T9"}]}'; echo
+curl -s -X POST "$BASE/api/drills/$DID/terminals/T1/reports" -H "$ctype" -d '{
+  "entries": [
+    {"seq": 1, "occurred_at": "2026-10-05T09:00:00Z", "event_type": "login", "content": "终端上线自检通过"},
+    {"seq": 4, "occurred_at": "2026-10-05T10:00:00Z", "event_type": "x", "content": "迟到的新序号"},
+    {"seq": 2, "occurred_at": "2026-10-05T09:10:00Z", "event_type": "water_level", "content": "被篡改"}
+  ]
+}'; echo
+curl -s "$BASE/api/drills/$DID/conflicts"; echo
+curl -s -X PUT "$BASE/api/drills/$DID/records/T1/1" -H "$ctype" \
+  -d '{"content":"试图更正","reason":"完成后更正"}'; echo
+curl -s -X POST "$BASE/api/drills/$DID/terminals/T1/gaps/lost" -H "$ctype" -d '{"seq":1}'; echo
+curl -s -X POST "$BASE/api/drills/$DID/seals" -H "$ctype" -d '{"note":"x"}'; echo
+
+echo "## 15. 重复完成 => 同一最终版本（200）；历史读取仍可用"
+curl -s -X POST "$BASE/api/drills/$DID/complete" -H "$ctype" \
+  -d '{"note":"再次完成","completed_by":"别人"}'; echo
+curl -s "$BASE/api/drills/$DID/seals"; echo
+curl -s "$BASE/api/drills/$DID/seals/2"; echo
+curl -s "$BASE/api/drills/$DID/timeline"; echo
+
 echo "DONE drill_id=$DID"

@@ -22,7 +22,16 @@ def _new_id(prefix: str) -> str:
 # ---------------------------------------------------------------- 序列化
 
 def _drill_dict(row: sqlite3.Row) -> dict:
-    return {"id": row["id"], "name": row["name"], "note": row["note"], "created_at": row["created_at"]}
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "note": row["note"],
+        "status": row["status"],
+        "completed_at": row["completed_at"],
+        "completed_by": row["completed_by"],
+        "final_seal_version": row["final_seal_version"],
+        "created_at": row["created_at"],
+    }
 
 
 def _terminal_dict(row: sqlite3.Row) -> dict:
@@ -73,6 +82,23 @@ def _require_drill(conn: sqlite3.Connection, drill_id: str) -> sqlite3.Row:
     if row is None:
         raise NotFoundError(f"演练不存在: {drill_id}", code="drill_not_found")
     return row
+
+
+def _require_drill_open(conn: sqlite3.Connection, drill_id: str) -> sqlite3.Row:
+    """要求演练存在且未完成；已完成的演练拒绝一切变更类操作。"""
+    drill = _require_drill(conn, drill_id)
+    if drill["status"] == "completed":
+        raise ConflictError(
+            f"演练 {drill_id} 已完成（最终封存版本 "
+            f"v{drill['final_seal_version']}），拒绝变更",
+            code="drill_completed",
+            details={
+                "status": "completed",
+                "final_seal_version": drill["final_seal_version"],
+                "completed_at": drill["completed_at"],
+            },
+        )
+    return drill
 
 
 def _terminal_in_drill(conn: sqlite3.Connection, drill_id: str, terminal_code: str) -> Optional[sqlite3.Row]:
@@ -129,7 +155,7 @@ def list_drills(conn: sqlite3.Connection) -> list[dict]:
 
 def register_terminals(conn: sqlite3.Connection, drill_id: str, items: list[dict]) -> dict:
     with transaction(conn):
-        _require_drill(conn, drill_id)
+        _require_drill_open(conn, drill_id)
         # 同一批内重复也要报冲突
         seen: set[str] = set()
         duplicates = []
@@ -182,7 +208,8 @@ def _validate_seq(value: Any) -> int:
 def submit_reports(conn: sqlite3.Connection, drill_id: str, terminal_code: str,
                    entries: list[dict]) -> dict:
     with transaction(conn):
-        _require_drill(conn, drill_id)
+        drill = _require_drill(conn, drill_id)
+        completed = drill["status"] == "completed"
         terminal = _require_terminal(conn, drill_id, terminal_code)
         terminal_id = terminal["id"]
         results: list[dict] = []
@@ -213,6 +240,15 @@ def submit_reports(conn: sqlite3.Connection, drill_id: str, terminal_code: str,
             ).fetchone()
 
             if existing is None:
+                if completed:
+                    # 演练已完成：非重复上报一律拒绝，不写入任何数据
+                    result.update(status="rejected", error={
+                        "code": "drill_completed",
+                        "message": "演练已完成，非重复上报被拒绝",
+                    })
+                    counts["rejected"] += 1
+                    results.append(result)
+                    continue
                 record_id = _new_id("rec")
                 ts = now_iso()
                 conn.execute(
@@ -240,9 +276,16 @@ def submit_reports(conn: sqlite3.Connection, drill_id: str, terminal_code: str,
             else:
                 result["record_id"] = existing["id"]
                 if existing["fingerprint"] == fingerprint:
-                    # 完整内容完全一致：幂等返回，不留任何新数据
+                    # 完整内容完全一致：幂等返回，不留任何新数据（完成后亦然）
                     result.update(status="duplicate")
                     counts["duplicate"] += 1
+                elif completed:
+                    # 演练已完成：冲突内容不得新增冲突证据，直接拒绝
+                    result.update(status="rejected", error={
+                        "code": "drill_completed",
+                        "message": "演练已完成，冲突内容被拒绝且不再留存冲突证据",
+                    })
+                    counts["rejected"] += 1
                 else:
                     conflict_id = _new_id("cfl")
                     incoming = _entry_json(occurred_at, event_type, content)
@@ -383,7 +426,7 @@ def get_drill_status(conn: sqlite3.Connection, drill_id: str) -> dict:
 def mark_lost(conn: sqlite3.Connection, drill_id: str, terminal_code: str,
               seq: Any, reason: Optional[str], confirmed_by: Optional[str]) -> dict:
     with transaction(conn):
-        _require_drill(conn, drill_id)
+        _require_drill_open(conn, drill_id)
         terminal = _require_terminal(conn, drill_id, terminal_code)
         seq = _validate_seq(seq)
 
@@ -472,7 +515,7 @@ def correct_record(conn: sqlite3.Connection, drill_id: str, terminal_code: str,
         raise APIError("更正理由 reason 必须是非空字符串", code="invalid_reason")
 
     with transaction(conn):
-        _require_drill(conn, drill_id)
+        _require_drill_open(conn, drill_id)
         terminal = _require_terminal(conn, drill_id, terminal_code)
         record = _find_record(conn, drill_id, terminal, seq)
 
@@ -582,71 +625,123 @@ def list_conflicts(conn: sqlite3.Connection, drill_id: str) -> dict:
 
 # ---------------------------------------------------------------- 封存
 
-def seal_drill(conn: sqlite3.Connection, drill_id: str, note: Optional[str]) -> dict:
-    with transaction(conn):
-        _require_drill(conn, drill_id)
-        gaps, _ = _gaps_for(conn, drill_id)
-        open_gaps = [g for g in gaps if g["state"] == "missing"]
-        if open_gaps:
-            raise ConflictError(
-                "仍有缺号未闭合（未补齐也未逐号确认丢失），不能封存",
-                code="unresolved_gaps",
-                details={"open_gaps": open_gaps},
-            )
+def _create_seal_snapshot(conn: sqlite3.Connection, drill_id: str,
+                          note: Optional[str]) -> int:
+    """在当前事务内生成一个只追加的不可变封存版本，返回版本号。
 
-        version_row = conn.execute(
-            "SELECT COALESCE(MAX(version), 0) AS v FROM seals WHERE drill_id = ?", (drill_id,)
-        ).fetchone()
-        version = version_row["v"] + 1
-        seal_id = _new_id("seal")
-        ts = now_iso()
+    调用方必须已确认缺号全部闭合；本函数与调用方共享同一事务，
+    保证“校验缺号 + 写快照（+ 完成状态翻转）”原子生效。
+    """
+    version_row = conn.execute(
+        "SELECT COALESCE(MAX(version), 0) AS v FROM seals WHERE drill_id = ?", (drill_id,)
+    ).fetchone()
+    version = version_row["v"] + 1
+    seal_id = _new_id("seal")
+    ts = now_iso()
+    conn.execute(
+        "INSERT INTO seals (id, drill_id, version, note, created_at) VALUES (?, ?, ?, ?, ?)",
+        (seal_id, drill_id, version, note, ts),
+    )
+
+    # 时间线快照（封存时刻的当前值）
+    for r in _timeline_rows(conn, drill_id):
         conn.execute(
-            "INSERT INTO seals (id, drill_id, version, note, created_at) VALUES (?, ?, ?, ?, ?)",
-            (seal_id, drill_id, version, note, ts),
+            "INSERT INTO seal_records (seal_id, drill_id, record_id, terminal_id, "
+            "terminal_code, seq, occurred_at, event_type, content, rev) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (seal_id, drill_id, r["id"], r["terminal_id"], r["terminal_code"],
+             r["seq"], r["occurred_at"], r["event_type"], r["content"], r["rev"]),
+        )
+    # 历次修订原文快照（封存版本可完整追溯）
+    rev_rows = conn.execute(
+        "SELECT vr.* FROM record_revisions vr JOIN records r ON r.id = vr.record_id "
+        "WHERE r.drill_id = ? ORDER BY vr.record_id, vr.rev",
+        (drill_id,),
+    ).fetchall()
+    for vr in rev_rows:
+        conn.execute(
+            "INSERT INTO seal_revisions (seal_id, record_id, rev, occurred_at, event_type, "
+            "content, reason, revised_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (seal_id, vr["record_id"], vr["rev"], vr["occurred_at"], vr["event_type"],
+             vr["content"], vr["reason"], vr["revised_by"], vr["created_at"]),
+        )
+    # 闭合证据：当时确认丢失的缺号，以及曾经确认丢失、后被迟到上报补齐的缺号
+    gap_rows = conn.execute(
+        "SELECT lg.*, t.code AS terminal_code FROM lost_gaps lg "
+        "JOIN terminals t ON t.id = lg.terminal_id WHERE lg.drill_id = ?",
+        (drill_id,),
+    ).fetchall()
+    for g in gap_rows:
+        conn.execute(
+            "INSERT INTO seal_gaps (seal_id, terminal_id, terminal_code, seq, closed_by) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (seal_id, g["terminal_id"], g["terminal_code"], g["seq"],
+             "filled" if g["resolved"] else "lost"),
+        )
+    return version
+
+
+def _open_gaps_or_raise(conn: sqlite3.Connection, drill_id: str) -> None:
+    gaps, _ = _gaps_for(conn, drill_id)
+    open_gaps = [g for g in gaps if g["state"] == "missing"]
+    if open_gaps:
+        raise ConflictError(
+            "仍有缺号未闭合（未补齐也未逐号确认丢失），不能封存",
+            code="unresolved_gaps",
+            details={"open_gaps": open_gaps},
         )
 
-        # 时间线快照（封存时刻的当前值）
-        for r in _timeline_rows(conn, drill_id):
-            conn.execute(
-                "INSERT INTO seal_records (seal_id, drill_id, record_id, terminal_id, "
-                "terminal_code, seq, occurred_at, event_type, content, rev) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (seal_id, drill_id, r["id"], r["terminal_id"], r["terminal_code"],
-                 r["seq"], r["occurred_at"], r["event_type"], r["content"], r["rev"]),
-            )
-        # 历次修订原文快照（封存版本可完整追溯）
-        rev_rows = conn.execute(
-            "SELECT vr.* FROM record_revisions vr JOIN records r ON r.id = vr.record_id "
-            "WHERE r.drill_id = ? ORDER BY vr.record_id, vr.rev",
-            (drill_id,),
-        ).fetchall()
-        for vr in rev_rows:
-            conn.execute(
-                "INSERT INTO seal_revisions (seal_id, record_id, rev, occurred_at, event_type, "
-                "content, reason, revised_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (seal_id, vr["record_id"], vr["rev"], vr["occurred_at"], vr["event_type"],
-                 vr["content"], vr["reason"], vr["revised_by"], vr["created_at"]),
-            )
-        # 闭合证据：当时确认丢失的缺号，以及曾经确认丢失、后被迟到上报补齐的缺号
-        gap_rows = conn.execute(
-            "SELECT lg.*, t.code AS terminal_code FROM lost_gaps lg "
-            "JOIN terminals t ON t.id = lg.terminal_id WHERE lg.drill_id = ?",
-            (drill_id,),
-        ).fetchall()
-        for g in gap_rows:
-            conn.execute(
-                "INSERT INTO seal_gaps (seal_id, terminal_id, terminal_code, seq, closed_by) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (seal_id, g["terminal_id"], g["terminal_code"], g["seq"],
-                 "filled" if g["resolved"] else "lost"),
-            )
 
+def seal_drill(conn: sqlite3.Connection, drill_id: str, note: Optional[str]) -> dict:
+    with transaction(conn):
+        _require_drill_open(conn, drill_id)
+        _open_gaps_or_raise(conn, drill_id)
+        version = _create_seal_snapshot(conn, drill_id, note)
     return get_seal(conn, drill_id, version)
+
+
+# ---------------------------------------------------------------- 完成演练
+
+def complete_drill(conn: sqlite3.Connection, drill_id: str, note: Optional[str],
+                   completed_by: Optional[str]) -> dict:
+    """主动完成演练：缺号全部闭合时，原子生成最终封存版本并转为已完成。
+
+    - 条件不满足：409 unresolved_gaps，不生成任何封存版本；
+    - 幂等：已完成的演练重复调用返回同一最终版本，不产生新版本。
+    """
+    with transaction(conn):
+        drill = _require_drill(conn, drill_id)
+        if drill["status"] == "completed":
+            # 重复完成：直接返回已生成的最终版本，忽略本次 note/completed_by
+            version = drill["final_seal_version"]
+            already_completed = True
+        else:
+            _open_gaps_or_raise(conn, drill_id)
+            version = _create_seal_snapshot(conn, drill_id, note)
+            conn.execute(
+                "UPDATE drills SET status = 'completed', completed_at = ?, "
+                "completed_by = ?, final_seal_version = ? WHERE id = ?",
+                (now_iso(), completed_by, version, drill_id),
+            )
+            already_completed = False
+
+    seal = get_seal(conn, drill_id, version)
+    with transaction(conn, immediate=False):
+        drill = _require_drill(conn, drill_id)
+    return {
+        "drill_id": drill_id,
+        "status": "completed",
+        "already_completed": already_completed,
+        "completed_at": drill["completed_at"],
+        "completed_by": drill["completed_by"],
+        "final_seal_version": version,
+        "seal": seal,
+    }
 
 
 def list_seals(conn: sqlite3.Connection, drill_id: str) -> dict:
     with transaction(conn, immediate=False):
-        _require_drill(conn, drill_id)
+        drill = _require_drill(conn, drill_id)
         rows = conn.execute(
             "SELECT * FROM seals WHERE drill_id = ? ORDER BY version", (drill_id,)
         ).fetchall()
@@ -661,6 +756,7 @@ def list_seals(conn: sqlite3.Connection, drill_id: str) -> dict:
                 "note": s["note"],
                 "created_at": s["created_at"],
                 "record_count": cnt,
+                "is_final": drill["final_seal_version"] == s["version"],
             })
     return {"drill_id": drill_id, "seals": out}
 

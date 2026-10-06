@@ -55,3 +55,9 @@ class MarkLost(BaseModel):
 
 class SealCreate(BaseModel):
     note: Optional[str] = None
+
+
+class DrillComplete(BaseModel):
+    # 完成时生成的最终封存版本附注；completed_by 记录演练负责人
+    note: Optional[str] = None
+    completed_by: Optional[str] = None

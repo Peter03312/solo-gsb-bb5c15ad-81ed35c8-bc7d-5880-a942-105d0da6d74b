@@ -9,13 +9,17 @@ from typing import Iterator
 from .config import get_settings
 
 SCHEMA_STATEMENTS = [
-    # 演练
+    # 演练：status 为 open / completed；完成后记录完成时刻、完成人与最终封存版本号
     """
     CREATE TABLE IF NOT EXISTS drills (
-        id          TEXT PRIMARY KEY,
-        name        TEXT,
-        note        TEXT,
-        created_at  TEXT NOT NULL
+        id                 TEXT PRIMARY KEY,
+        name               TEXT,
+        note               TEXT,
+        status             TEXT NOT NULL DEFAULT 'open',
+        completed_at       TEXT,
+        completed_by       TEXT,
+        final_seal_version INTEGER,
+        created_at         TEXT NOT NULL
     )
     """,
     # 终端先登记，terminal_code 在同一演练内唯一
@@ -165,6 +169,22 @@ def connect(db_path: str | None = None, *, busy_timeout_ms: int | None = None) -
     return conn
 
 
+# 旧库迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，这里逐列幂等补齐
+_DRILL_COLUMN_MIGRATIONS = {
+    "status": "ALTER TABLE drills ADD COLUMN status TEXT NOT NULL DEFAULT 'open'",
+    "completed_at": "ALTER TABLE drills ADD COLUMN completed_at TEXT",
+    "completed_by": "ALTER TABLE drills ADD COLUMN completed_by TEXT",
+    "final_seal_version": "ALTER TABLE drills ADD COLUMN final_seal_version INTEGER",
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(drills)")}
+    for column, stmt in _DRILL_COLUMN_MIGRATIONS.items():
+        if column not in existing:
+            conn.execute(stmt)
+
+
 def init_db(db_path: str | None = None) -> str:
     """幂等建库建表；返回实际数据库路径。"""
     settings = get_settings()
@@ -176,6 +196,7 @@ def init_db(db_path: str | None = None) -> str:
         conn.execute("PRAGMA journal_mode = WAL")
         for stmt in SCHEMA_STATEMENTS:
             conn.execute(stmt)
+        _migrate(conn)
         conn.commit()
     finally:
         conn.close()
